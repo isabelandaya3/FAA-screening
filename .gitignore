@@ -1,7 +1,11 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.pyc
-.playwright-browsers/
-screenshots/
+*.pyo
+*.pdf
+*.png
 *.xlsm
 *.xlsx
+FAA_edge_profile/
+.vscode/
+.env

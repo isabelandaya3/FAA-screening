@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -11,18 +12,27 @@ from datetime import datetime
 from hashlib import sha256
 from math import ceil
 
+import os
+import subprocess
+
 from openpyxl import load_workbook
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
-from PIL import Image
+
+from contextlib import contextmanager
+
+@contextmanager
+def _nullcontext():
+    yield
 
 # ---------------------------------------------------------------------------
 # Edit these paths before you run the script.
 # ---------------------------------------------------------------------------
-WORKBOOK_PATH = r"C:\Users\HP\Downloads\JOB NO - LINE NAME FAA Screening.xlsm"
-PDF_FOLDER = r"C:\Users\HP\OneDrive - scu.edu\Documents\FAA"
+WORKBOOK_PATH = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\74066820 - Sobrante-Grizzly-Claremont #1 FAA Screening.xlsm"
+PDF_FOLDER = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\#1 FAA"
 # ---------------------------------------------------------------------------
 
+DOWNLOADS_DIR = ""
 DATUM = "NAD83"
 SHEET = "FAA Criteria Tool"
 DATA_SHEET = "Data Sheet"
@@ -51,6 +61,7 @@ class Structure:
     structure_type: str = "TRANSMISSION_LINE$T_L_TOWER"
     last_result: str = ""
     last_hash: str = ""
+    used_elevation: int | None = None
 
     @property
     def elevation_whole(self) -> int:
@@ -100,34 +111,32 @@ def parse_dms(text: str) -> tuple[str, str]:
     raise ValueError(f"Unrecognized DMS value: {text!r}")
 
 
-def load_structures(workbook_path: Path) -> list[Structure]:
+def load_structures(workbook_path: Path): 
     wb = load_workbook(workbook_path, data_only=True)
     ws = wb[SHEET]
     rows: list[Structure] = []
     for r in range(2, ws.max_row + 1):
-        number = ws[f"B{r}"].value
+        number = ws[f"A{r}"].value
         if number is None or str(number).strip() == "":
             continue
         rows.append(
             Structure(
                 row=r,
                 number=str(number).strip(),
-                pls_file=str(ws[f"C{r}"].value or "").strip(),
-                lon_deg=_as_float(ws[f"D{r}"].value),
-                lat_deg=_as_float(ws[f"E{r}"].value),
-                elevation_ft=float(ws[f"F{r}"].value),
-                height_ft=float(ws[f"G{r}"].value),
-                lon_dms=str(ws[f"H{r}"].value).strip(),
-                lat_dms=str(ws[f"I{r}"].value).strip(),
-                traverseway=str(ws[f"J{r}"].value or "No Traverseway").strip(),
-                on_airport=str(ws[f"K{r}"].value or "No").strip(),
-                last_result=str(ws[f"L{r}"].value or "").strip(),
-                last_hash=str(ws[f"N{r}"].value or "").strip(),
+                pls_file=str(ws[f"B{r}"].value or "").strip(),
+                lon_deg=_as_float(ws[f"C{r}"].value),
+                lat_deg=_as_float(ws[f"D{r}"].value),
+                elevation_ft=float(ws[f"E{r}"].value),
+                height_ft=float(ws[f"F{r}"].value),
+                lon_dms=str(ws[f"G{r}"].value).strip(),
+                lat_dms=str(ws[f"H{r}"].value).strip(),
+                traverseway=str(ws[f"I{r}"].value or "No Traverseway").strip(),
+                on_airport=str(ws[f"J{r}"].value or "No").strip(),
+                last_result=str(ws[f"K{r}"].value or "").strip(),
+                last_hash=str(ws[f"M{r}"].value or "").strip(),
             )
         )
     return rows
-
-
 def input_fingerprint(structure: Structure, datum: str) -> str:
     payload = "|".join(
         [
@@ -136,11 +145,11 @@ def input_fingerprint(structure: Structure, datum: str) -> str:
             str(structure.lon_dms),
             str(structure.lat_deg),
             str(structure.lon_deg),
-            str(structure.elevation_ft),
             str(structure.height_ft),
             str(structure.on_airport),
             str(structure.structure_type),
             datum,
+            "USGS",
         ]
     )
     return sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -154,9 +163,9 @@ def write_result(
 ) -> None:
     wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     ws = wb[SHEET]
-    ws[f"L{structure.row}"] = result_text
-    ws[f"M{structure.row}"] = datetime.now()
-    ws[f"N{structure.row}"] = input_fingerprint(structure, DATUM)
+    ws[f"K{structure.row}"] = result_text
+    ws[f"L{structure.row}"] = datetime.now()
+    ws[f"M{structure.row}"] = input_fingerprint(structure, DATUM)
 
     data = wb[DATA_SHEET]
     if requires_filing:
@@ -172,7 +181,11 @@ def write_result(
         data[f"A{next_row}"] = structure.number
         data[f"B{next_row}"] = lat_fmt
         data[f"C{next_row}"] = lon_fmt
-        data[f"D{next_row}"] = structure.elevation_whole
+        data[f"D{next_row}"] = (
+            structure.used_elevation
+            if structure.used_elevation is not None
+            else structure.elevation_whole
+        )
         data[f"E{next_row}"] = structure.height_whole
     wb.save(workbook_path)
 
@@ -237,24 +250,46 @@ def select_structure_type(page) -> None:
     page.wait_for_timeout(400)
 
 
-def apply_user_elevation_and_datum(page, structure: Structure) -> None:
+def apply_nad83_datum(page) -> None:
     page.evaluate(
-        """([elev, datum]) => {
+        """(datum) => {
             const el = document.querySelector('notice-criteria');
             const scope = angular.element(el).isolateScope() || angular.element(el).scope();
             const point = scope.data.points.find(p => p.include) || scope.data.points[0];
             point.datum = datum;
-            point.siteElevation = Number(elev);
-            point.siteElevationSource = 'USER';
-            point.elevationDetails = {
-                validation: 'PASSED',
-                comments: 'Project spreadsheet / PLS-CADD survey elevation'
-            };
             if (scope.formData) scope.formData.datum = datum;
+            if (scope.noticeData && scope.noticeData.verifyPointModalPoint) {
+                scope.noticeData.verifyPointModalPoint.datum = datum;
+            }
             scope.$apply();
         }""",
-        [structure.elevation_whole, DATUM],
+        DATUM,
     )
+
+
+def read_accepted_elevation(page) -> tuple[int | None, str]:
+    payload = page.evaluate(
+        """() => {
+            const el = document.querySelector('notice-criteria');
+            if (!el || typeof angular === 'undefined') return null;
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            if (!scope) return null;
+            const point = scope.data.points.find(p => p.include) || scope.data.points[0];
+            if (!point) return null;
+            return {
+                elev: point.siteElevation,
+                source: point.siteElevationSource || ''
+            };
+        }"""
+    )
+    if not payload:
+        return None, ""
+    elev = payload.get("elev")
+    try:
+        elev_int = int(round(float(elev))) if elev is not None and elev != "" else None
+    except (TypeError, ValueError):
+        elev_int = None
+    return elev_int, str(payload.get("source") or "")
 
 
 def fill_point(page, structure: Structure) -> None:
@@ -266,7 +301,13 @@ def fill_point(page, structure: Structure) -> None:
         lon_dir = "W"
 
     page.evaluate(
-        """([lat, latDir, lon, lonDir, height, elev, onAirport, datum]) => {
+        """([lat, latDir, lon, lonDir, height, onAirport, datum]) => {
+            if (!document.getElementById('terrain-working-indicator-notice')) {
+                const marker = document.createElement('div');
+                marker.id = 'terrain-working-indicator-notice';
+                marker.style.display = 'none';
+                document.body.appendChild(marker);
+            }
             const el = document.querySelector('notice-criteria');
             const scope = angular.element(el).isolateScope() || angular.element(el).scope();
             const point = scope.data.points.find(p => p.include) || scope.data.points[0];
@@ -276,17 +317,15 @@ def fill_point(page, structure: Structure) -> None:
             point.lonDir = lonDir;
             point.datum = datum;
             point.structureHeight = Number(height);
-            point.siteElevation = Number(elev);
-            point.siteElevationSource = 'USER';
-            point.elevationDetails = {
-                validation: 'PASSED',
-                comments: 'Project spreadsheet / PLS-CADD survey elevation'
-            };
+            point.siteElevation = undefined;
+            point.siteElevationSource = undefined;
+            if (point.elevationDetails) {
+                point.elevationDetails.comments = '';
+            }
             point.state = 'COORD_DIRTY';
             scope.data.onAirport = !!onAirport;
             if (scope.formData) scope.formData.datum = datum;
             scope.$apply();
-            if (scope.redrawPoint) scope.redrawPoint(point);
             return true;
         }""",
         [
@@ -295,73 +334,108 @@ def fill_point(page, structure: Structure) -> None:
             lon_body,
             lon_dir,
             structure.height_whole,
-            structure.elevation_whole,
             structure.on_airport.lower() == "yes",
             DATUM,
         ],
     )
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(800)
     validate = page.get_by_role("button", name="VALIDATE")
-    if validate.count() and validate.first.is_visible():
-        validate.first.click()
-        page.wait_for_timeout(1200)
+    validate.first.wait_for(state="visible", timeout=10000)
+    validate.first.click()
     handle_point_modal(page, structure)
-    apply_user_elevation_and_datum(page, structure)
+    apply_nad83_datum(page)
     if structure.lat_deg is not None and structure.lon_deg is not None:
         page.evaluate(
-            """([lat, lon, elev, datum]) => {
+            """([lat, lon, datum]) => {
                 const el = document.querySelector('notice-criteria');
                 const scope = angular.element(el).isolateScope() || angular.element(el).scope();
                 const point = scope.data.points.find(p => p.include) || scope.data.points[0];
                 if (!point.lat) point.lat = lat;
                 if (!point.lon) point.lon = lon;
                 point.datum = datum;
-                point.siteElevation = Number(elev);
-                point.siteElevationSource = 'USER';
-                if (point.elevationDetails) {
-                    point.elevationDetails.validation = 'PASSED';
-                    point.elevationDetails.comments = 'Project spreadsheet / PLS-CADD survey elevation';
-                }
+                if (scope.formData) scope.formData.datum = datum;
                 if (scope.isPointValid) scope.isPointValid(point);
                 scope.$apply();
             }""",
-            [structure.lat_deg, structure.lon_deg, structure.elevation_whole, DATUM],
+            [structure.lat_deg, structure.lon_deg, DATUM],
         )
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('notice-criteria');
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            const point = scope.data.points.find(p => p.include) || scope.data.points[0];
+            return point && point.siteElevation !== undefined && point.siteElevation !== null
+                && point.siteElevation !== '' && String(point.siteElevationSource || '').toUpperCase() !== 'USER';
+        }""",
+        timeout=10000,
+    )
+    elev, source = read_accepted_elevation(page)
+    if elev is None or source.upper() == "USER":
+        raise RuntimeError(
+            f"FAA did not keep the NAD83/USGS site elevation (elev={elev!r}, source={source!r})"
+        )
+    structure.used_elevation = elev
     page.wait_for_timeout(400)
 
 
 def handle_point_modal(page, structure: Structure) -> None:
     modal = page.locator("#verifyNoticePointModal")
+    confirm = page.locator("#confirmPointModal")
     try:
-        modal.wait_for(state="visible", timeout=4000)
-    except PlaywrightTimeout:
-        return
-    own = page.locator("#customRadioInline2")
-    if own.count():
-        own.check()
-        elev_box = page.locator(
-            "input[ng-model='noticeData.verifyPointModalPoint.userSiteElev']"
-        )
-        elev_box.fill(str(structure.elevation_whole))
-        comment = page.locator("#verifyNoticePointModal textarea")
-        if comment.count():
-            comment.fill("Project spreadsheet / PLS-CADD survey elevation")
-        page.evaluate(
-            """([elev, datum]) => {
-                const el = document.querySelector('notice-criteria');
-                const scope = angular.element(el).isolateScope() || angular.element(el).scope();
-                if (scope.noticeData && scope.noticeData.verifyPointModalPoint) {
-                    scope.noticeData.verifyPointModalPoint.siteElevationSource = 'USER';
-                    scope.noticeData.verifyPointModalPoint.userSiteElev = Number(elev);
-                    scope.noticeData.verifyPointModalPoint.datum = datum;
-                }
-                scope.$apply();
+        page.wait_for_function(
+            """() => {
+                const isOpen = (id) => {
+                    const el = document.querySelector(id);
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && (el.classList.contains('show') || el.classList.contains('in'));
+                };
+                return isOpen('#verifyNoticePointModal') || isOpen('#confirmPointModal');
             }""",
-            [structure.elevation_whole, DATUM],
+            timeout=25000,
         )
+    except PlaywrightTimeout:
+        raise RuntimeError(
+            "FAA point validation dialog did not open after VALIDATE. "
+            "The NAD83/USGS site elevation was not available."
+        )
+    if confirm.count() and confirm.first.is_visible() and not (
+        modal.count() and modal.first.is_visible()
+    ):
+        page.get_by_role("button", name="Ok").click()
+        page.wait_for_timeout(400)
+        return
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('notice-criteria');
+            if (!el || typeof angular === 'undefined') return false;
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            const elev = scope && scope.noticeData && scope.noticeData.verifyPointModalPoint
+                && scope.noticeData.verifyPointModalPoint.usgsSiteElev;
+            return elev !== undefined && elev !== null && elev !== '';
+        }""",
+        timeout=20000,
+    )
+    keep = page.locator("#customRadioInline1")
+    if keep.count():
+        keep.check()
+    page.evaluate(
+        """(datum) => {
+            const el = document.querySelector('notice-criteria');
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            if (scope.noticeData && scope.noticeData.verifyPointModalPoint) {
+                scope.noticeData.verifyPointModalPoint.siteElevationSource = 'USGS';
+                scope.noticeData.verifyPointModalPoint.datum = datum;
+            }
+            if (scope.formData) scope.formData.datum = datum;
+            scope.$apply();
+        }""",
+        DATUM,
+    )
     page.get_by_role("button", name="Accept Point").click()
     page.wait_for_timeout(800)
-    apply_user_elevation_and_datum(page, structure)
+    apply_nad83_datum(page)
 
 
 def read_scope_results(page):
@@ -449,40 +523,140 @@ def requires_filing(result_text: str) -> bool:
         return True
     return False
 
-
 def save_result_pdf(page, dest: Path) -> None:
+    dest = dest.resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
     hide_modals(page)
-    page.wait_for_timeout(400)
-    png_path = dest.with_suffix(".png")
-    page.screenshot(path=str(png_path), full_page=True)
-    image = Image.open(png_path).convert("RGB")
-    image.save(dest, "PDF", resolution=150)
-    png_path.unlink(missing_ok=True)
-    if not dest.exists() or dest.stat().st_size < 1000:
-        raise RuntimeError(f"PDF was not written: {dest}")
 
+    page.evaluate(
+        """() => {
+            window.close = function () {};
+            window.print = function () {};
+        }"""
+    )
 
-def screen_one(page, structure: Structure, pdf_folder: Path) -> tuple[str, Path]:
+    print_btn = page.get_by_role("button", name="Print")
+    print_btn.first.wait_for(state="visible", timeout=15000)
+
+    # Capture the download event (we mainly want its URL)
+    pdf_url = None
+    download = None
     try:
-        print("  opening pre-screen ...")
-        page.goto(PRESCREEN_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
-        dismiss_overlays(page)
-        page.wait_for_selector("structure-type", timeout=30000)
+        with page.expect_download(timeout=30000) as dl:
+            print_btn.first.click()
+        download = dl.value
+        pdf_url = download.url
+    except Exception as exc:
+        print(f"  no download event ({exc}); will try response capture ...")
+
+    saved = False
+
+    # --- Attempt 1: normal save_as (works if browser survived) ---
+    if download is not None:
+        try:
+            if dest.exists():
+                dest.unlink()
+            download.save_as(str(dest))
+            saved = dest.exists() and dest.stat().st_size >= 1000
+        except Exception as exc:
+            print(f"  save_as failed ({exc}); fetching PDF by URL ...")
+
+    # --- Attempt 2: re-fetch the PDF URL via the context API (survives page close) ---
+    if not saved and pdf_url:
+        try:
+            resp = page.context.request.get(pdf_url, timeout=30000)
+            if resp.ok:
+                body = resp.body()
+                if body and len(body) >= 1000:
+                    if dest.exists():
+                        dest.unlink()
+                    with open(dest, "wb") as fh:
+                        fh.write(body)
+                    saved = True
+        except Exception as exc:
+            print(f"  URL fetch failed ({exc}); scanning downloads folder ...")
+
+    # --- Attempt 3: last resort, newest file in the temp downloads dir ---
+    if not saved:
+        time.sleep(2)
+        import glob
+        candidates = sorted(
+            glob.glob(os.path.join(DOWNLOADS_DIR, "**", "*"), recursive=True),
+            key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+            reverse=True,
+        )
+        for cand in candidates:
+            if os.path.isfile(cand) and os.path.getsize(cand) >= 1000:
+                if dest.exists():
+                    dest.unlink()
+                shutil.copy2(cand, dest)
+                saved = True
+                break
+
+    if not saved or not dest.exists() or dest.stat().st_size < 1000:
+        raise RuntimeError(f"FAA Print PDF was not written: {dest}")
+    print(f"  filed {dest} ({dest.stat().st_size} bytes)")
+
+def screen_one(page, structure: Structure, pdf_folder: Path, booted: bool) -> tuple[str, Path]:
+    try:
+        def cold_boot():
+            print("  cold-booting FAA app ...")
+            page.goto("https://oeaaa.faa.gov/oeaaa/oe3a/main/", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            dismiss_overlays(page)
+            link = page.get_by_role("link", name="Pre-Screening Tool")
+            if link.count():
+                link.first.click()
+            else:
+                page.goto(PRESCREEN_URL, wait_until="domcontentloaded")
+
+        def warm_nav():
+            print("  reusing warm session ...")
+            link = page.get_by_role("link", name="Pre-Screening Tool")
+            if link.count():
+                link.first.click()
+            else:
+                page.goto(PRESCREEN_URL, wait_until="domcontentloaded")
+
+        # Try warm nav first (if booted); fall back to a full cold boot on failure
+        rendered = False
+        if booted:
+            warm_nav()
+            try:
+                page.wait_for_selector("structure-type", timeout=8000)
+                rendered = True
+            except PlaywrightTimeout:
+                print("  warm session stalled -> cold boot ...")
+
+        if not rendered:
+            for attempt in range(3):
+                cold_boot()
+                try:
+                    page.wait_for_selector("structure-type", timeout=15000)
+                    rendered = True
+                    break
+                except PlaywrightTimeout:
+                    print(f"  structure-type not ready (attempt {attempt + 1}/3), retrying ...")
+                    page.wait_for_timeout(2000)
+
+        if not rendered:
+            raise RuntimeError("Pre-Screening Tool did not load after fallback attempts")
+
         print("  selecting structure type ...")
         select_structure_type(page)
-        print(f"  filling NAD83 point with spreadsheet elevation {structure.elevation_whole} ft ...")
+        print("  filling NAD83 point and keeping FAA/USGS site elevation ...")
         fill_point(page, structure)
+        print(f"  using site elevation {structure.used_elevation} ft ...")
         print("  submitting ...")
         result = submit_and_read(page)
         if not RESULT_RE.search(result):
             raise RuntimeError(f"No FAA result text for {structure.number}: {result[:300]!r}")
-        apply_user_elevation_and_datum(page, structure)
+        apply_nad83_datum(page)
         hide_modals(page)
         filing = requires_filing(result)
         dest = pdf_path(pdf_folder, structure.number, filing)
         remove_stale_pdfs(pdf_folder, structure.number, keep=None)
+        print("  printing official FAA PDF ...")
         save_result_pdf(page, dest)
         print(f"  saved {dest.name}")
         return result, dest
@@ -497,7 +671,6 @@ def screen_one(page, structure: Structure, pdf_folder: Path) -> tuple[str, Path]
         except Exception as shot_exc:
             print(f"  Could not save failure screenshot: {shot_exc}")
         raise
-
 
 def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
     pdf_folder.mkdir(parents=True, exist_ok=True)
@@ -514,15 +687,39 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
         return []
 
     outcomes: list[tuple[Structure, str, bool]] = []
+    import tempfile
+    global DOWNLOADS_DIR
+    DOWNLOADS_DIR = tempfile.mkdtemp(prefix="faa_dl_")
+
+
+    user_data_dir = r"C:\Users\And137460\FAA_edge_profile"
+
+    # Kill any leftover automation Edge holding the profile lock
+    lock = os.path.join(user_data_dir, "SingletonLock")
+    if os.path.exists(lock):
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "msedge.exe", "/T"],
+            capture_output=True,
+        )
+        time.sleep(1.5)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(viewport={"width": 1400, "height": 900})
-        page = context.new_page()
+        context = p.chromium.launch_persistent_context(
+            user_data_dir,
+            channel="msedge",
+            headless=False,
+            viewport={"width": 1400, "height": 900},
+            chromium_sandbox=True,
+            accept_downloads=True,
+            downloads_path=DOWNLOADS_DIR,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
         page.on("dialog", lambda dialog: dialog.accept())
         try:
+            booted = False
             for structure in to_screen:
                 print(f"Screening {structure.number} ...")
-                result, _dest = screen_one(page, structure, pdf_folder)
+                result, _dest = screen_one(page, structure, pdf_folder, booted)
+                booted = True
                 filing = requires_filing(result)
                 write_result(workbook, structure, result, filing)
                 outcomes.append((structure, result, filing))
@@ -530,7 +727,6 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
                 page.wait_for_timeout(2000)
         finally:
             context.close()
-            browser.close()
     return outcomes
 
 
