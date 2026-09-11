@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -14,7 +15,6 @@ from math import ceil
 from openpyxl import load_workbook
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
-from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Edit these paths before you run the script.
@@ -51,6 +51,7 @@ class Structure:
     structure_type: str = "TRANSMISSION_LINE$T_L_TOWER"
     last_result: str = ""
     last_hash: str = ""
+    used_elevation: int | None = None
 
     @property
     def elevation_whole(self) -> int:
@@ -136,11 +137,11 @@ def input_fingerprint(structure: Structure, datum: str) -> str:
             str(structure.lon_dms),
             str(structure.lat_deg),
             str(structure.lon_deg),
-            str(structure.elevation_ft),
             str(structure.height_ft),
             str(structure.on_airport),
             str(structure.structure_type),
             datum,
+            "USGS",
         ]
     )
     return sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -172,7 +173,11 @@ def write_result(
         data[f"A{next_row}"] = structure.number
         data[f"B{next_row}"] = lat_fmt
         data[f"C{next_row}"] = lon_fmt
-        data[f"D{next_row}"] = structure.elevation_whole
+        data[f"D{next_row}"] = (
+            structure.used_elevation
+            if structure.used_elevation is not None
+            else structure.elevation_whole
+        )
         data[f"E{next_row}"] = structure.height_whole
     wb.save(workbook_path)
 
@@ -237,24 +242,46 @@ def select_structure_type(page) -> None:
     page.wait_for_timeout(400)
 
 
-def apply_user_elevation_and_datum(page, structure: Structure) -> None:
+def apply_nad83_datum(page) -> None:
     page.evaluate(
-        """([elev, datum]) => {
+        """(datum) => {
             const el = document.querySelector('notice-criteria');
             const scope = angular.element(el).isolateScope() || angular.element(el).scope();
             const point = scope.data.points.find(p => p.include) || scope.data.points[0];
             point.datum = datum;
-            point.siteElevation = Number(elev);
-            point.siteElevationSource = 'USER';
-            point.elevationDetails = {
-                validation: 'PASSED',
-                comments: 'Project spreadsheet / PLS-CADD survey elevation'
-            };
             if (scope.formData) scope.formData.datum = datum;
+            if (scope.noticeData && scope.noticeData.verifyPointModalPoint) {
+                scope.noticeData.verifyPointModalPoint.datum = datum;
+            }
             scope.$apply();
         }""",
-        [structure.elevation_whole, DATUM],
+        DATUM,
     )
+
+
+def read_accepted_elevation(page) -> tuple[int | None, str]:
+    payload = page.evaluate(
+        """() => {
+            const el = document.querySelector('notice-criteria');
+            if (!el || typeof angular === 'undefined') return null;
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            if (!scope) return null;
+            const point = scope.data.points.find(p => p.include) || scope.data.points[0];
+            if (!point) return null;
+            return {
+                elev: point.siteElevation,
+                source: point.siteElevationSource || ''
+            };
+        }"""
+    )
+    if not payload:
+        return None, ""
+    elev = payload.get("elev")
+    try:
+        elev_int = int(round(float(elev))) if elev is not None and elev != "" else None
+    except (TypeError, ValueError):
+        elev_int = None
+    return elev_int, str(payload.get("source") or "")
 
 
 def fill_point(page, structure: Structure) -> None:
@@ -266,7 +293,13 @@ def fill_point(page, structure: Structure) -> None:
         lon_dir = "W"
 
     page.evaluate(
-        """([lat, latDir, lon, lonDir, height, elev, onAirport, datum]) => {
+        """([lat, latDir, lon, lonDir, height, onAirport, datum]) => {
+            if (!document.getElementById('terrain-working-indicator-notice')) {
+                const marker = document.createElement('div');
+                marker.id = 'terrain-working-indicator-notice';
+                marker.style.display = 'none';
+                document.body.appendChild(marker);
+            }
             const el = document.querySelector('notice-criteria');
             const scope = angular.element(el).isolateScope() || angular.element(el).scope();
             const point = scope.data.points.find(p => p.include) || scope.data.points[0];
@@ -276,17 +309,15 @@ def fill_point(page, structure: Structure) -> None:
             point.lonDir = lonDir;
             point.datum = datum;
             point.structureHeight = Number(height);
-            point.siteElevation = Number(elev);
-            point.siteElevationSource = 'USER';
-            point.elevationDetails = {
-                validation: 'PASSED',
-                comments: 'Project spreadsheet / PLS-CADD survey elevation'
-            };
+            point.siteElevation = undefined;
+            point.siteElevationSource = undefined;
+            if (point.elevationDetails) {
+                point.elevationDetails.comments = '';
+            }
             point.state = 'COORD_DIRTY';
             scope.data.onAirport = !!onAirport;
             if (scope.formData) scope.formData.datum = datum;
             scope.$apply();
-            if (scope.redrawPoint) scope.redrawPoint(point);
             return true;
         }""",
         [
@@ -295,73 +326,108 @@ def fill_point(page, structure: Structure) -> None:
             lon_body,
             lon_dir,
             structure.height_whole,
-            structure.elevation_whole,
             structure.on_airport.lower() == "yes",
             DATUM,
         ],
     )
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(800)
     validate = page.get_by_role("button", name="VALIDATE")
-    if validate.count() and validate.first.is_visible():
-        validate.first.click()
-        page.wait_for_timeout(1200)
+    validate.first.wait_for(state="visible", timeout=10000)
+    validate.first.click()
     handle_point_modal(page, structure)
-    apply_user_elevation_and_datum(page, structure)
+    apply_nad83_datum(page)
     if structure.lat_deg is not None and structure.lon_deg is not None:
         page.evaluate(
-            """([lat, lon, elev, datum]) => {
+            """([lat, lon, datum]) => {
                 const el = document.querySelector('notice-criteria');
                 const scope = angular.element(el).isolateScope() || angular.element(el).scope();
                 const point = scope.data.points.find(p => p.include) || scope.data.points[0];
                 if (!point.lat) point.lat = lat;
                 if (!point.lon) point.lon = lon;
                 point.datum = datum;
-                point.siteElevation = Number(elev);
-                point.siteElevationSource = 'USER';
-                if (point.elevationDetails) {
-                    point.elevationDetails.validation = 'PASSED';
-                    point.elevationDetails.comments = 'Project spreadsheet / PLS-CADD survey elevation';
-                }
+                if (scope.formData) scope.formData.datum = datum;
                 if (scope.isPointValid) scope.isPointValid(point);
                 scope.$apply();
             }""",
-            [structure.lat_deg, structure.lon_deg, structure.elevation_whole, DATUM],
+            [structure.lat_deg, structure.lon_deg, DATUM],
         )
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('notice-criteria');
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            const point = scope.data.points.find(p => p.include) || scope.data.points[0];
+            return point && point.siteElevation !== undefined && point.siteElevation !== null
+                && point.siteElevation !== '' && String(point.siteElevationSource || '').toUpperCase() !== 'USER';
+        }""",
+        timeout=10000,
+    )
+    elev, source = read_accepted_elevation(page)
+    if elev is None or source.upper() == "USER":
+        raise RuntimeError(
+            f"FAA did not keep the NAD83/USGS site elevation (elev={elev!r}, source={source!r})"
+        )
+    structure.used_elevation = elev
     page.wait_for_timeout(400)
 
 
 def handle_point_modal(page, structure: Structure) -> None:
     modal = page.locator("#verifyNoticePointModal")
+    confirm = page.locator("#confirmPointModal")
     try:
-        modal.wait_for(state="visible", timeout=4000)
-    except PlaywrightTimeout:
-        return
-    own = page.locator("#customRadioInline2")
-    if own.count():
-        own.check()
-        elev_box = page.locator(
-            "input[ng-model='noticeData.verifyPointModalPoint.userSiteElev']"
-        )
-        elev_box.fill(str(structure.elevation_whole))
-        comment = page.locator("#verifyNoticePointModal textarea")
-        if comment.count():
-            comment.fill("Project spreadsheet / PLS-CADD survey elevation")
-        page.evaluate(
-            """([elev, datum]) => {
-                const el = document.querySelector('notice-criteria');
-                const scope = angular.element(el).isolateScope() || angular.element(el).scope();
-                if (scope.noticeData && scope.noticeData.verifyPointModalPoint) {
-                    scope.noticeData.verifyPointModalPoint.siteElevationSource = 'USER';
-                    scope.noticeData.verifyPointModalPoint.userSiteElev = Number(elev);
-                    scope.noticeData.verifyPointModalPoint.datum = datum;
-                }
-                scope.$apply();
+        page.wait_for_function(
+            """() => {
+                const isOpen = (id) => {
+                    const el = document.querySelector(id);
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && (el.classList.contains('show') || el.classList.contains('in'));
+                };
+                return isOpen('#verifyNoticePointModal') || isOpen('#confirmPointModal');
             }""",
-            [structure.elevation_whole, DATUM],
+            timeout=25000,
         )
+    except PlaywrightTimeout:
+        raise RuntimeError(
+            "FAA point validation dialog did not open after VALIDATE. "
+            "The NAD83/USGS site elevation was not available."
+        )
+    if confirm.count() and confirm.first.is_visible() and not (
+        modal.count() and modal.first.is_visible()
+    ):
+        page.get_by_role("button", name="Ok").click()
+        page.wait_for_timeout(400)
+        return
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('notice-criteria');
+            if (!el || typeof angular === 'undefined') return false;
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            const elev = scope && scope.noticeData && scope.noticeData.verifyPointModalPoint
+                && scope.noticeData.verifyPointModalPoint.usgsSiteElev;
+            return elev !== undefined && elev !== null && elev !== '';
+        }""",
+        timeout=20000,
+    )
+    keep = page.locator("#customRadioInline1")
+    if keep.count():
+        keep.check()
+    page.evaluate(
+        """(datum) => {
+            const el = document.querySelector('notice-criteria');
+            const scope = angular.element(el).isolateScope() || angular.element(el).scope();
+            if (scope.noticeData && scope.noticeData.verifyPointModalPoint) {
+                scope.noticeData.verifyPointModalPoint.siteElevationSource = 'USGS';
+                scope.noticeData.verifyPointModalPoint.datum = datum;
+            }
+            if (scope.formData) scope.formData.datum = datum;
+            scope.$apply();
+        }""",
+        DATUM,
+    )
     page.get_by_role("button", name="Accept Point").click()
     page.wait_for_timeout(800)
-    apply_user_elevation_and_datum(page, structure)
+    apply_nad83_datum(page)
 
 
 def read_scope_results(page):
@@ -451,16 +517,22 @@ def requires_filing(result_text: str) -> bool:
 
 
 def save_result_pdf(page, dest: Path) -> None:
+    dest = dest.resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
     hide_modals(page)
-    page.wait_for_timeout(400)
-    png_path = dest.with_suffix(".png")
-    page.screenshot(path=str(png_path), full_page=True)
-    image = Image.open(png_path).convert("RGB")
-    image.save(dest, "PDF", resolution=150)
-    png_path.unlink(missing_ok=True)
+    print_btn = page.get_by_role("button", name="Print")
+    print_btn.first.wait_for(state="visible", timeout=15000)
+    with page.expect_download(timeout=30000) as download_info:
+        print_btn.first.click()
+    download = download_info.value
+    if dest.exists():
+        dest.unlink()
+    download.save_as(str(dest))
+    if (not dest.exists() or dest.stat().st_size < 1000) and download.path():
+        shutil.copy2(download.path(), dest)
     if not dest.exists() or dest.stat().st_size < 1000:
-        raise RuntimeError(f"PDF was not written: {dest}")
+        raise RuntimeError(f"FAA Print PDF was not written: {dest}")
+    print(f"  filed {dest} ({dest.stat().st_size} bytes)")
 
 
 def screen_one(page, structure: Structure, pdf_folder: Path) -> tuple[str, Path]:
@@ -472,17 +544,19 @@ def screen_one(page, structure: Structure, pdf_folder: Path) -> tuple[str, Path]
         page.wait_for_selector("structure-type", timeout=30000)
         print("  selecting structure type ...")
         select_structure_type(page)
-        print(f"  filling NAD83 point with spreadsheet elevation {structure.elevation_whole} ft ...")
+        print("  filling NAD83 point and keeping FAA/USGS site elevation ...")
         fill_point(page, structure)
+        print(f"  using site elevation {structure.used_elevation} ft ...")
         print("  submitting ...")
         result = submit_and_read(page)
         if not RESULT_RE.search(result):
             raise RuntimeError(f"No FAA result text for {structure.number}: {result[:300]!r}")
-        apply_user_elevation_and_datum(page, structure)
+        apply_nad83_datum(page)
         hide_modals(page)
         filing = requires_filing(result)
         dest = pdf_path(pdf_folder, structure.number, filing)
         remove_stale_pdfs(pdf_folder, structure.number, keep=None)
+        print("  printing official FAA PDF ...")
         save_result_pdf(page, dest)
         print(f"  saved {dest.name}")
         return result, dest
