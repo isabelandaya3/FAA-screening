@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -13,14 +15,17 @@ from hashlib import sha256
 from math import ceil
 
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
-# Edit these paths before you run the script.
+# Edit these paths before you run the script. The first existing path wins.
 # ---------------------------------------------------------------------------
 WORKBOOK_PATH = r"C:\Users\HP\Downloads\JOB NO - LINE NAME FAA Screening.xlsm"
 PDF_FOLDER = r"C:\Users\HP\OneDrive - scu.edu\Documents\FAA"
+WORK_WORKBOOK_PATH = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\74066820 - Sobrante-Grizzly-Claremont #1 FAA Screening.xlsm"
+WORK_PDF_FOLDER = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\#1 FAA"
 # ---------------------------------------------------------------------------
 
 DATUM = "NAD83"
@@ -29,6 +34,90 @@ DATA_SHEET = "Data Sheet"
 MAX_FILE_ROWS = 250
 PRESCREEN_URL = "https://oeaaa.faa.gov/oeaaa/oe3a/main/#/noticePrescreen"
 STRUCTURE_TYPE_ID = "TRANSMISSION_LINE$T_L_TOWER"
+DOWNLOADS_DIR = ""
+PROFILE_DIR = Path(__file__).resolve().parent / "FAA_edge_profile"
+
+
+@dataclass
+class SheetMap:
+    number: str = "B"
+    pls: str = "C"
+    lon_deg: str = "D"
+    lat_deg: str = "E"
+    elevation: str = "F"
+    height: str = "G"
+    lon_dms: str = "H"
+    lat_dms: str = "I"
+    traverseway: str = "J"
+    on_airport: str = "K"
+    result: str = "L"
+    timestamp: str = "M"
+    hashcol: str = "N"
+
+
+SHEET_MAP = SheetMap()
+
+
+def first_existing_path(paths: list[Path]) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
+def resolve_workbook_path() -> Path:
+    return first_existing_path([Path(WORKBOOK_PATH), Path(WORK_WORKBOOK_PATH)])
+
+
+def resolve_pdf_folder() -> Path:
+    return first_existing_path([Path(PDF_FOLDER), Path(WORK_PDF_FOLDER)])
+
+
+def detect_sheet_map(ws) -> SheetMap:
+    headers: dict[str, str] = {}
+    for col in range(1, 20):
+        raw = ws.cell(1, col).value
+        if raw is None:
+            continue
+        headers[" ".join(str(raw).lower().split())] = get_column_letter(col)
+
+    def pick(*needles: str, default: str) -> str:
+        for text, letter in headers.items():
+            if all(needle in text for needle in needles):
+                return letter
+        return default
+
+    if not any("structure number" in text or "latitude" in text for text in headers):
+        return SheetMap(
+            number="A",
+            pls="B",
+            lon_deg="C",
+            lat_deg="D",
+            elevation="E",
+            height="F",
+            lon_dms="G",
+            lat_dms="H",
+            traverseway="I",
+            on_airport="J",
+            result="K",
+            timestamp="L",
+            hashcol="M",
+        )
+    return SheetMap(
+        number=pick("structure number", default="B"),
+        pls=pick("pls", default="C"),
+        lon_deg=pick("longitude", "deg", default="D"),
+        lat_deg=pick("latitude", "deg", default="E"),
+        elevation=pick("elevation", default="F"),
+        height=pick("structure height", default="G"),
+        lon_dms=pick("longitude", "dms", default="H"),
+        lat_dms=pick("latitude", "dms", default="I"),
+        traverseway=pick("traverseway", default="J"),
+        on_airport=pick("on airport", default="K"),
+        result=pick("result", default="L"),
+        timestamp=pick("time", default="M"),
+        hashcol=get_column_letter(column_index_from_string(pick("time", default="M")) + 1),
+    )
 RESULT_RE = re.compile(
     r"(required to file|not required to file|does not exceed|exceed)",
     re.I,
@@ -102,34 +191,59 @@ def parse_dms(text: str) -> tuple[str, str]:
 
 
 def load_structures(workbook_path: Path) -> list[Structure]:
+    global SHEET_MAP
     wb = load_workbook(workbook_path, data_only=True)
     ws = wb[SHEET]
+    SHEET_MAP = detect_sheet_map(ws)
+    cols = SHEET_MAP
     rows: list[Structure] = []
     for r in range(2, ws.max_row + 1):
-        number = ws[f"B{r}"].value
+        number = ws[f"{cols.number}{r}"].value
         if number is None or str(number).strip() == "":
+            continue
+        elev_val = ws[f"{cols.elevation}{r}"].value
+        height_val = ws[f"{cols.height}{r}"].value
+        if elev_val in (None, "") or height_val in (None, ""):
             continue
         rows.append(
             Structure(
                 row=r,
                 number=str(number).strip(),
-                pls_file=str(ws[f"C{r}"].value or "").strip(),
-                lon_deg=_as_float(ws[f"D{r}"].value),
-                lat_deg=_as_float(ws[f"E{r}"].value),
-                elevation_ft=float(ws[f"F{r}"].value),
-                height_ft=float(ws[f"G{r}"].value),
-                lon_dms=str(ws[f"H{r}"].value).strip(),
-                lat_dms=str(ws[f"I{r}"].value).strip(),
-                traverseway=str(ws[f"J{r}"].value or "No Traverseway").strip(),
-                on_airport=str(ws[f"K{r}"].value or "No").strip(),
-                last_result=str(ws[f"L{r}"].value or "").strip(),
-                last_hash=str(ws[f"N{r}"].value or "").strip(),
+                pls_file=str(ws[f"{cols.pls}{r}"].value or "").strip(),
+                lon_deg=_as_float(ws[f"{cols.lon_deg}{r}"].value),
+                lat_deg=_as_float(ws[f"{cols.lat_deg}{r}"].value),
+                elevation_ft=float(elev_val),
+                height_ft=float(height_val),
+                lon_dms=str(ws[f"{cols.lon_dms}{r}"].value).strip(),
+                lat_dms=str(ws[f"{cols.lat_dms}{r}"].value).strip(),
+                traverseway=str(ws[f"{cols.traverseway}{r}"].value or "No Traverseway").strip(),
+                on_airport=str(ws[f"{cols.on_airport}{r}"].value or "No").strip(),
+                last_result=str(ws[f"{cols.result}{r}"].value or "").strip(),
+                last_hash=str(ws[f"{cols.hashcol}{r}"].value or "").strip(),
             )
         )
     return rows
 
 
-def input_fingerprint(structure: Structure, datum: str) -> str:
+def _norm_dms(text: str) -> str:
+    body, hemi = parse_dms(text)
+    return f"{body}{hemi}".upper()
+
+
+def content_key(structure: Structure) -> str:
+    """Identity used to decide whether FAA must be queried again."""
+    payload = "|".join(
+        [
+            _norm_dms(structure.lat_dms),
+            _norm_dms(structure.lon_dms),
+            str(structure.height_whole),
+            str(structure.elevation_whole),
+        ]
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def legacy_fingerprint(structure: Structure, datum: str) -> str:
     payload = "|".join(
         [
             structure.number,
@@ -147,6 +261,10 @@ def input_fingerprint(structure: Structure, datum: str) -> str:
     return sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def input_fingerprint(structure: Structure, datum: str) -> str:
+    return content_key(structure)
+
+
 def write_result(
     workbook_path: Path,
     structure: Structure,
@@ -155,9 +273,10 @@ def write_result(
 ) -> None:
     wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     ws = wb[SHEET]
-    ws[f"L{structure.row}"] = result_text
-    ws[f"M{structure.row}"] = datetime.now()
-    ws[f"N{structure.row}"] = input_fingerprint(structure, DATUM)
+    cols = SHEET_MAP
+    ws[f"{cols.result}{structure.row}"] = result_text
+    ws[f"{cols.timestamp}{structure.row}"] = datetime.now()
+    ws[f"{cols.hashcol}{structure.row}"] = content_key(structure)
 
     data = wb[DATA_SHEET]
     if requires_filing:
@@ -199,13 +318,127 @@ def remove_stale_pdfs(folder: Path, number: str, keep: Path | None = None) -> No
             path.unlink(missing_ok=True)
 
 
-def should_screen(structure: Structure, folder: Path) -> bool:
-    digest = input_fingerprint(structure, DATUM)
-    if structure.last_hash != digest or not structure.last_result:
+def existing_named_pdf(folder: Path, number: str) -> Path | None:
+    for filing in (True, False):
+        path = pdf_path(folder, number, filing)
+        if path.exists():
+            return path
+    return None
+
+
+def read_pdf_fields(path: Path) -> tuple[str, str, int, int] | None:
+    try:
+        text = path.read_bytes().decode("latin-1", errors="ignore")
+    except OSError:
+        return None
+    tokens = re.findall(r"\(([^\)]{1,80})\) Tj", text)
+    try:
+        lat_i = tokens.index("Latitude")
+        lat, lon, height, elev = tokens[lat_i + 5 : lat_i + 9]
+        return lat.strip(), lon.strip(), int(float(height)), int(float(elev))
+    except (ValueError, IndexError):
+        return None
+
+
+def dms_equal(left: str, right: str) -> bool:
+    try:
+        return _norm_dms(left) == _norm_dms(right)
+    except ValueError:
+        return re.sub(r"\s+", "", left).upper() == re.sub(r"\s+", "", right).upper()
+
+
+def pdf_matches_structure(path: Path, structure: Structure) -> bool:
+    fields = read_pdf_fields(path)
+    if not fields:
+        return False
+    lat, lon, height, _elev = fields
+    return (
+        dms_equal(lat, structure.lat_dms)
+        and dms_equal(lon, structure.lon_dms)
+        and height == structure.height_whole
+    )
+
+
+def pdf_is_reusable(path: Path, structure: Structure) -> bool:
+    fields = read_pdf_fields(path)
+    if fields is None:
         return True
-    need = pdf_path(folder, structure.number, True)
-    skip = pdf_path(folder, structure.number, False)
-    return not (need.exists() or skip.exists())
+    return pdf_matches_structure(path, structure)
+
+
+def find_matching_pdf(
+    structure: Structure, folder: Path, structures: list[Structure]
+) -> Path | None:
+    own = existing_named_pdf(folder, structure.number)
+    if own and pdf_is_reusable(own, structure):
+        return own
+    key = content_key(structure)
+    for other in structures:
+        if other.number == structure.number:
+            continue
+        if content_key(other) != key:
+            continue
+        found = existing_named_pdf(folder, other.number)
+        if found and pdf_is_reusable(found, structure):
+            return found
+    for path in folder.glob("*_FAA Screening_*.pdf"):
+        if pdf_matches_structure(path, structure):
+            return path
+    return None
+
+
+def find_prior_result(
+    structure: Structure, structures: list[Structure]
+) -> str:
+    key = content_key(structure)
+    if structure.last_result:
+        return structure.last_result
+    for other in structures:
+        if other.number != structure.number and content_key(other) == key and other.last_result:
+            return other.last_result
+    return ""
+
+
+def place_existing_pdf(
+    src: Path, structure: Structure, folder: Path, live_numbers: set[str]
+) -> Path:
+    filing = "NEED TO FILE" in src.name
+    dest = pdf_path(folder, structure.number, filing)
+    if src.resolve() == dest.resolve():
+        return dest
+    src_stem = src.name.split("_FAA Screening_")[0]
+    donor_still_used = any(safe_structure_name(num) == src_stem for num in live_numbers)
+    if dest.exists() and dest.resolve() != src.resolve():
+        dest.unlink()
+    if donor_still_used:
+        shutil.copy2(src, dest)
+        print(f"  copied existing printout {src.name} -> {dest.name}")
+    else:
+        src.replace(dest)
+        print(f"  renamed existing printout {src.name} -> {dest.name}")
+    return dest
+
+
+def refresh_hash_only(workbook_path: Path, structure: Structure) -> None:
+    if structure.last_hash == content_key(structure):
+        return
+    wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
+    ws = wb[SHEET]
+    ws[f"{SHEET_MAP.hashcol}{structure.row}"] = content_key(structure)
+    wb.save(workbook_path)
+
+
+def decide_action(
+    structure: Structure, structures: list[Structure], folder: Path
+) -> tuple[str, Path | None]:
+    """Return ('skip' | 'reuse' | 'screen', optional existing pdf)."""
+    matching = find_matching_pdf(structure, folder, structures)
+    own = existing_named_pdf(folder, structure.number)
+    if own and matching is not None and own.resolve() == matching.resolve():
+        return "skip", own
+    if matching is not None:
+        return "reuse", matching
+    return "screen", None
 
 
 def dismiss_overlays(page) -> None:
@@ -516,32 +749,147 @@ def requires_filing(result_text: str) -> bool:
     return False
 
 
+def _install_pdf_capture(page) -> None:
+    page.evaluate(
+        """() => {
+            if (window.__faaPdfCaptureInstalled) return;
+            window.__faaPdfCaptureInstalled = true;
+            window.__faaPdfBase64 = null;
+            const remember = (blob) => {
+                if (!blob || window.__faaPdfBase64) return;
+                const type = (blob.type || '').toLowerCase();
+                if (type && type.indexOf('pdf') === -1 && type !== '') return;
+                blob.arrayBuffer().then((buf) => {
+                    const bytes = new Uint8Array(buf);
+                    let bin = '';
+                    const chunk = 0x8000;
+                    for (let i = 0; i < bytes.length; i += chunk) {
+                        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                    }
+                    const encoded = btoa(bin);
+                    if (encoded.indexOf('JVBER') === 0) {
+                        window.__faaPdfBase64 = encoded;
+                    }
+                });
+            };
+            const orig = URL.createObjectURL;
+            URL.createObjectURL = function(obj) {
+                try { remember(obj); } catch (err) {}
+                return orig.apply(this, arguments);
+            };
+        }"""
+    )
+
+
+def _pdf_bytes_from_capture(page) -> bytes | None:
+    try:
+        page.wait_for_function("() => !!window.__faaPdfBase64", timeout=20000)
+    except PlaywrightTimeout:
+        return None
+    encoded = page.evaluate("() => window.__faaPdfBase64")
+    if not encoded:
+        return None
+    data = base64.b64decode(encoded)
+    if data.startswith(b"%PDF") and len(data) >= 1000:
+        return data
+    return None
+
+
 def save_result_pdf(page, dest: Path) -> None:
     dest = dest.resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
     hide_modals(page)
     print_btn = page.get_by_role("button", name="Print")
     print_btn.first.wait_for(state="visible", timeout=15000)
-    with page.expect_download(timeout=30000) as download_info:
-        print_btn.first.click()
-    download = download_info.value
-    if dest.exists():
-        dest.unlink()
-    download.save_as(str(dest))
-    if (not dest.exists() or dest.stat().st_size < 1000) and download.path():
-        shutil.copy2(download.path(), dest)
+    _install_pdf_capture(page)
+
+    download = None
+    try:
+        with page.expect_download(timeout=25000) as download_info:
+            print_btn.first.click()
+        download = download_info.value
+    except PlaywrightTimeout:
+        print("  no browser download event; reading the in-page Print PDF ...")
+        if print_btn.first.is_visible():
+            print_btn.first.click()
+
+    captured = _pdf_bytes_from_capture(page)
+    if captured:
+        dest.write_bytes(captured)
+        print(f"  filed {dest} ({dest.stat().st_size} bytes)")
+        return
+
+    if download is not None:
+        try:
+            if dest.exists():
+                dest.unlink()
+            download.save_as(str(dest))
+        except Exception as exc:
+            print(f"  save_as failed ({exc})")
+            src = download.path()
+            if src and Path(src).exists():
+                shutil.copy2(src, dest)
+
+    if (not dest.exists() or dest.stat().st_size < 1000) and DOWNLOADS_DIR:
+        named = list(Path(DOWNLOADS_DIR).rglob("prescreen.pdf"))
+        if named:
+            shutil.copy2(named[0], dest)
+
     if not dest.exists() or dest.stat().st_size < 1000:
         raise RuntimeError(f"FAA Print PDF was not written: {dest}")
     print(f"  filed {dest} ({dest.stat().st_size} bytes)")
 
 
-def screen_one(page, structure: Structure, pdf_folder: Path) -> tuple[str, Path]:
+def open_browser(playwright, downloads_dir: Path):
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = PROFILE_DIR / "SingletonLock"
+    if lock.exists():
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    options = dict(
+        headless=False,
+        viewport={"width": 1400, "height": 900},
+        accept_downloads=True,
+        downloads_path=str(downloads_dir),
+        chromium_sandbox=True,
+    )
     try:
-        print("  opening pre-screen ...")
+        return playwright.chromium.launch_persistent_context(
+            str(PROFILE_DIR), channel="msedge", **options
+        )
+    except Exception as exc:
+        print(f"  System Edge not available ({exc}); using Playwright Chromium.")
+        return playwright.chromium.launch_persistent_context(str(PROFILE_DIR), **options)
+
+
+def open_prescreen(page, reset_form: bool) -> None:
+    dismiss_overlays(page)
+    already_open = "noticePrescreen" in (page.url or "")
+    if already_open and reset_form:
+        clear = page.get_by_role("button", name="Clear")
+        if clear.count() and clear.first.is_visible():
+            clear.first.click()
+            page.wait_for_timeout(400)
+        else:
+            already_open = False
+    if not already_open:
+        print("  opening Pre-Screening Tool ...")
         page.goto(PRESCREEN_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
         dismiss_overlays(page)
-        page.wait_for_selector("structure-type", timeout=30000)
+    page.wait_for_selector("structure-type", timeout=30000)
+    page.wait_for_function(
+        """() => typeof angular !== 'undefined'
+            && !!document.querySelector('notice-criteria')""",
+        timeout=30000,
+    )
+
+
+def screen_one(page, structure: Structure, pdf_folder: Path, booted: bool) -> tuple[str, Path]:
+    try:
+        open_prescreen(page, reset_form=booted)
+
         print("  selecting structure type ...")
         select_structure_type(page)
         print("  filling NAD83 point and keeping FAA/USGS site elevation ...")
@@ -574,29 +922,56 @@ def screen_one(page, structure: Structure, pdf_folder: Path) -> tuple[str, Path]
 
 
 def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
+    global DOWNLOADS_DIR
     pdf_folder.mkdir(parents=True, exist_ok=True)
     structures = load_structures(workbook)
     if not structures:
         raise SystemExit(f"No structure rows found in {workbook}")
 
-    to_screen = [s for s in structures if should_screen(s, pdf_folder)]
-    skipped = [s for s in structures if s not in to_screen]
-    for structure in skipped:
-        print(f"Skipping {structure.number}: no new data")
+    live_numbers = {item.number for item in structures}
+    to_screen: list[Structure] = []
+    outcomes: list[tuple[Structure, str, bool]] = []
+    for structure in structures:
+        action, existing = decide_action(structure, structures, pdf_folder)
+        if action == "skip":
+            print(f"Skipping {structure.number}: same lat/long/height/elevation already on file")
+            refresh_hash_only(workbook, structure)
+            continue
+        if action == "reuse" and existing is not None:
+            print(
+                f"Reusing printout for {structure.number}: "
+                "same lat/long/height/elevation, new structure number"
+            )
+            dest = place_existing_pdf(existing, structure, pdf_folder, live_numbers)
+            result = find_prior_result(structure, structures)
+            if not result:
+                filing = "NEED TO FILE" in dest.name
+                result = (
+                    "Based on the information you provided, you are required to file notice with the FAA."
+                    if filing
+                    else "Based on the information you provided, you are not required to file notice with the FAA."
+                )
+            filing = requires_filing(result)
+            write_result(workbook, structure, result, filing)
+            outcomes.append((structure, result, filing))
+            continue
+        to_screen.append(structure)
+
     if not to_screen:
         print("Nothing new to screen.")
-        return []
+        return outcomes
 
-    outcomes: list[tuple[Structure, str, bool]] = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(viewport={"width": 1400, "height": 900})
-        page = context.new_page()
+    DOWNLOADS_DIR = tempfile.mkdtemp(prefix="faa_dl_")
+    with sync_playwright() as playwright:
+        context = open_browser(playwright, Path(DOWNLOADS_DIR))
+        page = context.pages[0] if context.pages else context.new_page()
         page.on("dialog", lambda dialog: dialog.accept())
         try:
+            booted = False
             for structure in to_screen:
                 print(f"Screening {structure.number} ...")
-                result, _dest = screen_one(page, structure, pdf_folder)
+                result, _dest = screen_one(page, structure, pdf_folder, booted)
+                booted = True
                 filing = requires_filing(result)
                 write_result(workbook, structure, result, filing)
                 outcomes.append((structure, result, filing))
@@ -604,15 +979,16 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
                 page.wait_for_timeout(2000)
         finally:
             context.close()
-            browser.close()
     return outcomes
 
 
 def main() -> None:
-    workbook = Path(WORKBOOK_PATH)
-    pdf_folder = Path(PDF_FOLDER)
+    workbook = resolve_workbook_path()
+    pdf_folder = resolve_pdf_folder()
     if not workbook.exists():
         raise SystemExit(f"Workbook not found: {workbook}")
+    print(f"Workbook: {workbook}")
+    print(f"PDF folder: {pdf_folder}")
     outcomes = run(workbook, pdf_folder)
     print("\nDone.")
     for structure, result, filing in outcomes:

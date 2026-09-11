@@ -3,5 +3,8 @@ __pycache__/
 *.pyc
 .playwright-browsers/
 screenshots/
+FAA_edge_profile/
 *.xlsm
 *.xlsx
+*.pdf
+*.png
