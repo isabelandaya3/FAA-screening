@@ -22,10 +22,8 @@ from playwright.sync_api import sync_playwright
 # ---------------------------------------------------------------------------
 # Edit these paths before you run the script. The first existing path wins.
 # ---------------------------------------------------------------------------
-WORKBOOK_PATH = r"C:\Users\HP\Downloads\JOB NO - LINE NAME FAA Screening.xlsm"
-PDF_FOLDER = r"C:\Users\HP\OneDrive - scu.edu\Documents\FAA"
-WORK_WORKBOOK_PATH = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\74066820 - Sobrante-Grizzly-Claremont #1 FAA Screening.xlsm"
-WORK_PDF_FOLDER = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\#1 FAA"
+WORKBOOK_PATH = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\74066820 - Sobrante-Grizzly-Claremont #2 FAA Screening.xlsm"
+PDF_FOLDER = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\#2 FAA"
 # ---------------------------------------------------------------------------
 
 DATUM = "NAD83"
@@ -63,15 +61,6 @@ def first_existing_path(paths: list[Path]) -> Path:
         if path.exists():
             return path
     return paths[0]
-
-
-def resolve_workbook_path() -> Path:
-    return first_existing_path([Path(WORKBOOK_PATH), Path(WORK_WORKBOOK_PATH)])
-
-
-def resolve_pdf_folder() -> Path:
-    return first_existing_path([Path(PDF_FOLDER), Path(WORK_PDF_FOLDER)])
-
 
 def detect_sheet_map(ws) -> SheetMap:
     headers: dict[str, str] = {}
@@ -983,12 +972,8 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
 
 
 def main() -> None:
-    workbook = resolve_workbook_path()
-    pdf_folder = resolve_pdf_folder()
-    if not workbook.exists():
-        raise SystemExit(f"Workbook not found: {workbook}")
-    print(f"Workbook: {workbook}")
-    print(f"PDF folder: {pdf_folder}")
+    workbook = WORKBOOK_PATH
+    pdf_folder = PDF_FOLDER
     outcomes = run(workbook, pdf_folder)
     print("\nDone.")
     for structure, result, filing in outcomes:
