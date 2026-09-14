@@ -20,7 +20,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
-# Edit these paths before you run the script. The first existing path wins.
+# Black & Veatch workbook and printout folder (work computer).
 # ---------------------------------------------------------------------------
 WORKBOOK_PATH = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\74066820 - Sobrante-Grizzly-Claremont #2 FAA Screening.xlsm"
 PDF_FOLDER = r"C:\Users\And137460\OneDrive - Black & Veatch\PG&E Sacramento & LA OHTL - PGE Projects and Files\Projects\Sobrante\Working\30% Design\#2 FAA"
@@ -55,12 +55,6 @@ class SheetMap:
 
 SHEET_MAP = SheetMap()
 
-
-def first_existing_path(paths: list[Path]) -> Path:
-    for path in paths:
-        if path.exists():
-            return path
-    return paths[0]
 
 def detect_sheet_map(ws) -> SheetMap:
     headers: dict[str, str] = {}
@@ -972,8 +966,12 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
 
 
 def main() -> None:
-    workbook = WORKBOOK_PATH
-    pdf_folder = PDF_FOLDER
+    workbook = Path(WORKBOOK_PATH)
+    pdf_folder = Path(PDF_FOLDER)
+    if not workbook.exists():
+        raise SystemExit(f"Workbook not found: {workbook}")
+    print(f"Workbook: {workbook}")
+    print(f"PDF folder: {pdf_folder}")
     outcomes = run(workbook, pdf_folder)
     print("\nDone.")
     for structure, result, filing in outcomes:
