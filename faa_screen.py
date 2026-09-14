@@ -835,11 +835,11 @@ def _install_pdf_capture(page) -> None:
     )
 
 
-def _pdf_bytes_from_capture(page) -> bytes | None:
+def _pdf_bytes_from_capture(page, timeout_ms: int = 8000) -> bytes | None:
     try:
         if page.is_closed():
             return None
-        page.wait_for_function("() => !!window.__faaPdfBase64", timeout=20000)
+        page.wait_for_function("() => !!window.__faaPdfBase64", timeout=timeout_ms)
         encoded = page.evaluate("() => window.__faaPdfBase64")
     except PlaywrightError:
         return None
@@ -857,7 +857,6 @@ def _take_downloaded_pdf(since: float) -> bytes | None:
     folder = Path(DOWNLOADS_DIR)
     if not folder.exists():
         return None
-    time.sleep(0.8)
     candidates = [
         path
         for path in folder.rglob("*.pdf")
@@ -881,47 +880,21 @@ def save_result_pdf(page, dest: Path) -> None:
     print_btn.first.wait_for(state="visible", timeout=15000)
     _install_pdf_capture(page)
     started = time.time()
+    print_btn.first.click()
 
-    download = None
-    try:
-        with page.expect_download(timeout=25000) as download_info:
-            print_btn.first.click()
-        download = download_info.value
-    except PlaywrightTimeout:
-        print("  no browser download event; reading the in-page Print PDF ...")
-        try:
-            if not page.is_closed() and print_btn.first.is_visible():
-                print_btn.first.click()
-        except PlaywrightError:
-            pass
-    except PlaywrightError as exc:
-        print(f"  browser closed during Print ({exc}); recovering the PDF file ...")
-
-    captured = _pdf_bytes_from_capture(page)
+    captured = _pdf_bytes_from_capture(page, timeout_ms=8000)
     if captured:
         dest.write_bytes(captured)
         print(f"  filed {dest} ({dest.stat().st_size} bytes)")
         return
 
-    if download is not None:
-        try:
-            if dest.exists():
-                dest.unlink()
-            download.save_as(str(dest))
-        except Exception as exc:
-            print(f"  save_as failed ({exc})")
-            src = download.path()
-            if src and Path(src).exists():
-                shutil.copy2(src, dest)
+    recovered = _take_downloaded_pdf(started)
+    if recovered:
+        dest.write_bytes(recovered)
+        print(f"  filed {dest} ({dest.stat().st_size} bytes)")
+        return
 
-    if not dest.exists() or dest.stat().st_size < 1000:
-        recovered = _take_downloaded_pdf(started)
-        if recovered:
-            dest.write_bytes(recovered)
-
-    if not dest.exists() or dest.stat().st_size < 1000:
-        raise RuntimeError(f"FAA Print PDF was not written: {dest}")
-    print(f"  filed {dest} ({dest.stat().st_size} bytes)")
+    raise RuntimeError(f"FAA Print PDF was not written: {dest}")
 
 
 def open_browser(playwright, downloads_dir: Path):
@@ -1080,7 +1053,7 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
                     print(f"  {structure.number}: {result[:180]}")
                     try:
                         if not page.is_closed():
-                            page.wait_for_timeout(1500)
+                            page.wait_for_timeout(400)
                     except PlaywrightError:
                         booted = False
                 except Exception as exc:
