@@ -7,6 +7,7 @@ import re
 import shutil
 import tempfile
 import time
+import warnings
 from pathlib import Path
 
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from math import ceil
 
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
@@ -34,6 +36,10 @@ PRESCREEN_URL = "https://oeaaa.faa.gov/oeaaa/oe3a/main/#/noticePrescreen"
 STRUCTURE_TYPE_ID = "TRANSMISSION_LINE$T_L_TOWER"
 DOWNLOADS_DIR = ""
 PROFILE_DIR = Path(__file__).resolve().parent / "FAA_edge_profile"
+warnings.filterwarnings(
+    "ignore",
+    message="Data Validation extension is not supported and will be removed",
+)
 
 
 @dataclass
@@ -249,14 +255,12 @@ def input_fingerprint(structure: Structure, datum: str) -> str:
     return content_key(structure)
 
 
-def write_result(
-    workbook_path: Path,
+def apply_result_to_workbook(
+    wb,
     structure: Structure,
     result_text: str,
     requires_filing: bool,
 ) -> None:
-    workbook_path = Path(workbook_path)
-    wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     ws = wb[SHEET]
     cols = SHEET_MAP
     ws[f"{cols.result}{structure.row}"] = result_text
@@ -283,7 +287,41 @@ def write_result(
             else structure.elevation_whole
         )
         data[f"E{next_row}"] = structure.height_whole
-    wb.save(workbook_path)
+
+
+def save_workbook_retry(wb, workbook_path: Path, attempts: int = 10) -> bool:
+    workbook_path = Path(workbook_path)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            wb.save(workbook_path)
+            return True
+        except PermissionError as exc:
+            last_exc = exc
+            wait = min(20, 2 * attempt)
+            print(
+                f"  workbook is locked (close it in Excel if it is open). "
+                f"Retry {attempt}/{attempts} in {wait}s ..."
+            )
+            time.sleep(wait)
+    print(f"  WARNING: could not save workbook ({last_exc}). Results so far are still in memory.")
+    return False
+
+
+def write_result(
+    workbook_path: Path,
+    structure: Structure,
+    result_text: str,
+    requires_filing: bool,
+    wb=None,
+    save: bool = True,
+) -> None:
+    workbook_path = Path(workbook_path)
+    if wb is None:
+        wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
+    apply_result_to_workbook(wb, structure, result_text, requires_filing)
+    if save:
+        save_workbook_retry(wb, workbook_path)
 
 
 def safe_structure_name(number: str) -> str:
@@ -406,14 +444,18 @@ def place_existing_pdf(
     return dest
 
 
-def refresh_hash_only(workbook_path: Path, structure: Structure) -> None:
-    workbook_path = Path(workbook_path)
+def refresh_hash_only(
+    workbook_path: Path, structure: Structure, wb=None, save: bool = True
+) -> None:
     if structure.last_hash == content_key(structure):
         return
-    wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
+    workbook_path = Path(workbook_path)
+    if wb is None:
+        wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     ws = wb[SHEET]
     ws[f"{SHEET_MAP.hashcol}{structure.row}"] = content_key(structure)
-    wb.save(workbook_path)
+    if save:
+        save_workbook_retry(wb, workbook_path)
 
 
 def decide_action(
@@ -740,14 +782,17 @@ def requires_filing(result_text: str) -> bool:
 def _install_pdf_capture(page) -> None:
     page.evaluate(
         """() => {
-            if (window.__faaPdfCaptureInstalled) return;
-            window.__faaPdfCaptureInstalled = true;
+            window.close = function () {};
+            window.__faaPdfCaptureId = (window.__faaPdfCaptureId || 0) + 1;
             window.__faaPdfBase64 = null;
+            const captureId = window.__faaPdfCaptureId;
             const remember = (blob) => {
-                if (!blob || window.__faaPdfBase64) return;
+                if (!blob) return;
                 const type = (blob.type || '').toLowerCase();
                 if (type && type.indexOf('pdf') === -1 && type !== '') return;
+                const myId = captureId;
                 blob.arrayBuffer().then((buf) => {
+                    if (window.__faaPdfCaptureId !== myId) return;
                     const bytes = new Uint8Array(buf);
                     let bin = '';
                     const chunk = 0x8000;
@@ -760,25 +805,70 @@ def _install_pdf_capture(page) -> None:
                     }
                 });
             };
-            const orig = URL.createObjectURL;
-            URL.createObjectURL = function(obj) {
-                try { remember(obj); } catch (err) {}
-                return orig.apply(this, arguments);
-            };
+            window.__faaRememberPdfBlob = remember;
+            if (!window.__faaPdfCaptureInstalled) {
+                window.__faaPdfCaptureInstalled = true;
+                const orig = URL.createObjectURL;
+                URL.createObjectURL = function(obj) {
+                    try {
+                        if (window.__faaRememberPdfBlob) window.__faaRememberPdfBlob(obj);
+                    } catch (err) {}
+                    return orig.apply(this, arguments);
+                };
+            }
+            if (window.jsPDF && window.jsPDF.API && !window.__faaJsPdfHooked) {
+                window.__faaJsPdfHooked = true;
+                const origSave = window.jsPDF.API.save;
+                window.jsPDF.API.save = function(filename) {
+                    try {
+                        const blob = this.output('blob');
+                        if (window.__faaRememberPdfBlob) window.__faaRememberPdfBlob(blob);
+                        return blob;
+                    } catch (err) {
+                        if (typeof origSave === 'function') {
+                            return origSave.apply(this, arguments);
+                        }
+                    }
+                };
+            }
         }"""
     )
 
 
 def _pdf_bytes_from_capture(page) -> bytes | None:
     try:
+        if page.is_closed():
+            return None
         page.wait_for_function("() => !!window.__faaPdfBase64", timeout=20000)
-    except PlaywrightTimeout:
+        encoded = page.evaluate("() => window.__faaPdfBase64")
+    except PlaywrightError:
         return None
-    encoded = page.evaluate("() => window.__faaPdfBase64")
     if not encoded:
         return None
     data = base64.b64decode(encoded)
     if data.startswith(b"%PDF") and len(data) >= 1000:
+        return data
+    return None
+
+
+def _take_downloaded_pdf(since: float) -> bytes | None:
+    if not DOWNLOADS_DIR:
+        return None
+    folder = Path(DOWNLOADS_DIR)
+    if not folder.exists():
+        return None
+    time.sleep(0.8)
+    candidates = [
+        path
+        for path in folder.rglob("*.pdf")
+        if path.is_file() and path.stat().st_size >= 1000 and path.stat().st_mtime >= since - 2
+    ]
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda path: path.stat().st_mtime)
+    data = newest.read_bytes()
+    newest.unlink(missing_ok=True)
+    if data.startswith(b"%PDF"):
         return data
     return None
 
@@ -790,6 +880,7 @@ def save_result_pdf(page, dest: Path) -> None:
     print_btn = page.get_by_role("button", name="Print")
     print_btn.first.wait_for(state="visible", timeout=15000)
     _install_pdf_capture(page)
+    started = time.time()
 
     download = None
     try:
@@ -798,8 +889,13 @@ def save_result_pdf(page, dest: Path) -> None:
         download = download_info.value
     except PlaywrightTimeout:
         print("  no browser download event; reading the in-page Print PDF ...")
-        if print_btn.first.is_visible():
-            print_btn.first.click()
+        try:
+            if not page.is_closed() and print_btn.first.is_visible():
+                print_btn.first.click()
+        except PlaywrightError:
+            pass
+    except PlaywrightError as exc:
+        print(f"  browser closed during Print ({exc}); recovering the PDF file ...")
 
     captured = _pdf_bytes_from_capture(page)
     if captured:
@@ -818,10 +914,10 @@ def save_result_pdf(page, dest: Path) -> None:
             if src and Path(src).exists():
                 shutil.copy2(src, dest)
 
-    if (not dest.exists() or dest.stat().st_size < 1000) and DOWNLOADS_DIR:
-        named = list(Path(DOWNLOADS_DIR).rglob("prescreen.pdf"))
-        if named:
-            shutil.copy2(named[0], dest)
+    if not dest.exists() or dest.stat().st_size < 1000:
+        recovered = _take_downloaded_pdf(started)
+        if recovered:
+            dest.write_bytes(recovered)
 
     if not dest.exists() or dest.stat().st_size < 1000:
         raise RuntimeError(f"FAA Print PDF was not written: {dest}")
@@ -918,6 +1014,7 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
     if not structures:
         raise SystemExit(f"No structure rows found in {workbook}")
 
+    wb = load_workbook(workbook, keep_vba=workbook.suffix.lower() == ".xlsm")
     live_numbers = {item.number for item in structures}
     to_screen: list[Structure] = []
     outcomes: list[tuple[Structure, str, bool]] = []
@@ -925,7 +1022,7 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
         action, existing = decide_action(structure, structures, pdf_folder)
         if action == "skip":
             print(f"Skipping {structure.number}: same lat/long/height/elevation already on file")
-            refresh_hash_only(workbook, structure)
+            refresh_hash_only(workbook, structure, wb=wb, save=False)
             continue
         if action == "reuse" and existing is not None:
             print(
@@ -942,33 +1039,64 @@ def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
                     else "Based on the information you provided, you are not required to file notice with the FAA."
                 )
             filing = requires_filing(result)
-            write_result(workbook, structure, result, filing)
+            write_result(workbook, structure, result, filing, wb=wb, save=False)
             outcomes.append((structure, result, filing))
             continue
         to_screen.append(structure)
+    save_workbook_retry(wb, workbook)
 
     if not to_screen:
         print("Nothing new to screen.")
         return outcomes
 
     DOWNLOADS_DIR = tempfile.mkdtemp(prefix="faa_dl_")
-    with sync_playwright() as playwright:
+
+    def new_page(playwright):
         context = open_browser(playwright, Path(DOWNLOADS_DIR))
         page = context.pages[0] if context.pages else context.new_page()
         page.on("dialog", lambda dialog: dialog.accept())
+        return context, page
+
+    with sync_playwright() as playwright:
+        context, page = new_page(playwright)
         try:
             booted = False
             for structure in to_screen:
                 print(f"Screening {structure.number} ...")
-                result, _dest = screen_one(page, structure, pdf_folder, booted)
-                booted = True
-                filing = requires_filing(result)
-                write_result(workbook, structure, result, filing)
-                outcomes.append((structure, result, filing))
-                print(f"  {structure.number}: {result[:180]}")
-                page.wait_for_timeout(2000)
+                try:
+                    if page.is_closed():
+                        print("  browser was closed; opening a new window ...")
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                        context, page = new_page(playwright)
+                        booted = False
+                    result, _dest = screen_one(page, structure, pdf_folder, booted)
+                    booted = True
+                    filing = requires_filing(result)
+                    write_result(workbook, structure, result, filing, wb=wb)
+                    outcomes.append((structure, result, filing))
+                    print(f"  {structure.number}: {result[:180]}")
+                    try:
+                        if not page.is_closed():
+                            page.wait_for_timeout(1500)
+                    except PlaywrightError:
+                        booted = False
+                except Exception as exc:
+                    print(f"  continuing after error on {structure.number}: {type(exc).__name__}: {exc}")
+                    booted = False
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    context, page = new_page(playwright)
         finally:
-            context.close()
+            try:
+                context.close()
+            except Exception:
+                pass
+    save_workbook_retry(wb, workbook)
     return outcomes
 
 
