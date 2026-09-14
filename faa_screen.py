@@ -175,6 +175,7 @@ def parse_dms(text: str) -> tuple[str, str]:
 
 def load_structures(workbook_path: Path) -> list[Structure]:
     global SHEET_MAP
+    workbook_path = Path(workbook_path)
     wb = load_workbook(workbook_path, data_only=True)
     ws = wb[SHEET]
     SHEET_MAP = detect_sheet_map(ws)
@@ -254,6 +255,7 @@ def write_result(
     result_text: str,
     requires_filing: bool,
 ) -> None:
+    workbook_path = Path(workbook_path)
     wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     ws = wb[SHEET]
     cols = SHEET_MAP
@@ -290,11 +292,13 @@ def safe_structure_name(number: str) -> str:
 
 
 def pdf_path(folder: Path, number: str, requires_filing: bool) -> Path:
+    folder = Path(folder)
     suffix = "NEED TO FILE" if requires_filing else "FILE NOT REQUIRED"
     return folder / f"{safe_structure_name(number)}_FAA Screening_{suffix}.pdf"
 
 
 def remove_stale_pdfs(folder: Path, number: str, keep: Path | None = None) -> None:
+    folder = Path(folder)
     prefix = f"{safe_structure_name(number)}_FAA Screening_"
     for path in folder.glob(f"{prefix}*.pdf"):
         if keep is None or path.resolve() != keep.resolve():
@@ -403,6 +407,7 @@ def place_existing_pdf(
 
 
 def refresh_hash_only(workbook_path: Path, structure: Structure) -> None:
+    workbook_path = Path(workbook_path)
     if structure.last_hash == content_key(structure):
         return
     wb = load_workbook(workbook_path, keep_vba=workbook_path.suffix.lower() == ".xlsm")
@@ -906,6 +911,8 @@ def screen_one(page, structure: Structure, pdf_folder: Path, booted: bool) -> tu
 
 def run(workbook: Path, pdf_folder: Path) -> list[tuple[Structure, str, bool]]:
     global DOWNLOADS_DIR
+    workbook = Path(workbook)
+    pdf_folder = Path(pdf_folder)
     pdf_folder.mkdir(parents=True, exist_ok=True)
     structures = load_structures(workbook)
     if not structures:
